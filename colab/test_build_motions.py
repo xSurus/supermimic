@@ -10,7 +10,7 @@ from build_motions import convert  # noqa: E402
 
 def test_missing_csvs_exits_nonzero(tmp_path):
   r = subprocess.run(
-    [sys.executable, "colab/build_motions.py", "--csv-dir", str(tmp_path),
+    [sys.executable, str(Path(__file__).parent / "build_motions.py"), "--csv-dir", str(tmp_path),
      "--out-dir", str(tmp_path / "o")],
     capture_output=True, text=True,
   )  # fmt: skip
