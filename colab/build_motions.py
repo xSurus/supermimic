@@ -10,7 +10,10 @@ from mjlab.scripts.csv_to_npz import MotionLoader
 
 def convert(csv: Path, out: Path, device: str) -> None:
   loader = MotionLoader(str(csv), input_fps=30.0, output_fps=50.0, device=device)
-  np.savez(out, **loader.arrays())
+  tmp = out.with_suffix(".tmp")
+  with open(tmp, "wb") as f:
+    np.savez(f, **loader.arrays())
+  tmp.replace(out)
 
 
 if __name__ == "__main__":
