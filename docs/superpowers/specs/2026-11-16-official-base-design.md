@@ -25,7 +25,7 @@ The thesis so far ran on a third-party reproduction (CuboiLeo/SuperMimic-Reprodu
 
 ## Constraints
 
-- Python 3.13 and the dependency versions in the official `uv.lock`.
+- Python 3.13. The official `uv.lock` is stale against `mjlab_research` HEAD, so the lock is re-resolved, with torch, warp-lang and mjviser pinned to the versions in `../mjlab_research/uv.lock`.
 - `mjlab` resolves from the sibling path `../mjlab_research`.
 - The Mac has no CUDA, so anything that needs a GPU is verified on Colab by Alexander.
 - Training logs and checkpoints go through W&B. Alexander has an account.

@@ -2,7 +2,7 @@
 
 Date: 2026-11-16
 Machine: macOS (Darwin 27.2.0), Apple Silicon arm64, no CUDA, Python 3.13.5.
-Commits: supermimic 1b5d70e (branch thesis) plus the pin commit, mjlab_research dd51a9f.
+Commits: supermimic 1b5d70e (branch thesis) plus the pin commit 0c300f2, mjlab_research dd51a9f.
 
 ## Resolved versions
 
