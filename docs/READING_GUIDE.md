@@ -89,7 +89,7 @@ Status words: "exists" means the code is there, "partial" means a piece is there
 |---|---|---|
 | Learned-model arm (SuperMimic) | `src/supermimic/learners/policy_learner.py:BpttPolicyLearner._train_batch` | exists |
 | In-between arm: real-sim states, model Jacobians on fresh 32-step windows | New learner beside `_train_batch`; the window has to come from the real env as in `src/supermimic/runners/supermimic_runner.py:SuperMimicRunner.step`, then each step re-evaluated with `src/supermimic/envs/world_model_env.py:WorldModelEnv._wm_step` and a straight-through state | missing |
-| Replaying the sampled action noise | Noise is drawn in `SuperMimicRunner.step` and not stored; the buffer schema is `BaseRunner._buffer_schema` | missing |
+| Replaying the sampled action noise | `SuperMimicRunner.step` adds the noise before calling `BaseRunner._step_and_store`, so the buffer's `action` field is the noisy action that was executed. The noise is not stored as a separate field | exists |
 | Noisy observation the actor saw | `ReplayBuffer` stores the clean `actor_obs` only when `_stores_actor_obs` is true; the noise from `StateRepresentation.add_proprio_noise` is not stored | missing |
 | Exact-gradient arm | Nothing in either repo; would need NablaEngine | missing |
 | Gradient agreement by contact phase | No contact labels in the buffer schema | missing |
