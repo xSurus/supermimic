@@ -13,5 +13,5 @@ def test_reward_ceiling_counts_positive_weights_only():
 
 
 def test_normalized_return():
-  # A 501-frame clip is 501 env steps in mjlab (motion_end fires after len steps).
-  assert normalized_return(25.05, 0.1, 501) == pytest.approx(0.5)
+  # A 501-frame clip is 500 env steps (reset already advances one frame).
+  assert normalized_return(25.0, 0.1, 501) == pytest.approx(0.5)

@@ -39,8 +39,8 @@ def reward_ceiling(step_dt: float, rewards: Any) -> float:
   return step_dt * sum(t.weight for t in rewards.values() if t.weight > 0.0)
 
 
-def normalized_return(reward_sum: float, max_step: float, num_steps: int) -> float:
-  return reward_sum / (max_step * num_steps)
+def normalized_return(reward_sum: float, max_step: float, clip_len: int) -> float:
+  return reward_sum / (max_step * (clip_len - 1))
 
 
 def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
@@ -105,11 +105,10 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   model_dir = download_artifact_cached(artifact)
   wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   actor = build_actor(runner_cfg, wm, device)
+  actor.set_slot_mix({"motion": 1.0})
   actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
   actor.eval()
-  active_specs = [
-    ts for ts in actor.task_specs if runner_cfg.slot_mix.get(ts.name, 0.0) > 0.0
-  ]
+  active_specs = [ts for ts in actor.task_specs if ts.name == "motion"]
   proprio = runner_cfg.actor_obs == "proprio"
 
   env.reset()
@@ -117,6 +116,7 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   alive = torch.ones(num_clips, dtype=torch.bool, device=device)
   fell = torch.zeros(num_clips, dtype=torch.bool, device=device)
   reward_sum = torch.zeros(num_clips, device=device)
+  steps = torch.zeros(num_clips, dtype=torch.long, device=device)
   with torch.inference_mode():
     while alive.any():
       obs = env.get_observations()
@@ -142,6 +142,7 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
       tm = base.termination_manager
       failed = (tm.terminated & ~tm.time_outs).to(device)
       reward_sum += torch.where(alive, rewards.to(device), 0.0)
+      steps += alive
       ended = alive & dones.to(device).bool()
       fell |= ended & failed
       alive &= ~ended
@@ -150,14 +151,18 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   rows = []
   for i in range(num_clips):
     frames = int((ends[i] - starts[i]).item())
-    # clip_len steps: terminations and rewards run before the command advances
-    # time_steps, so motion_end fires on step clip_len.
+    # frames - 1 steps: env.reset() already advances time_steps by one, so an
+    # episode starts at start + 1 and motion_end fires after frames - 1 steps.
+    if not fell[i] and int(steps[i]) != frames - 1:
+      print(f"[WARN] clip {i}: {int(steps[i])} steps, expected {frames - 1}")
     rows.append(
       {
         "index": i,
         "clip": motion.motion_names[i],
         "frames": frames,
-        "normalized_return": normalized_return(float(reward_sum[i]), max_step, frames),
+        "normalized_return": normalized_return(
+          float(reward_sum[i]), max_step, frames - 1
+        ),
         "fell": bool(fell[i]),
       }
     )
