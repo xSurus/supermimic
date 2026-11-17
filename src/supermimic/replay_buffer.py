@@ -93,6 +93,22 @@ class ReplayBuffer:
     slot = (base + torch.where(reachable, ages, first_age)) % T
     return self._storage[env_idx[:, None], slot], ~reachable
 
+  def sample_newest(self, sequence_length: int, batch_size: int) -> TensorDict:
+    """The newest ``L`` frames of ``B`` envs, oldest first. Envs are distinct
+    when ``B <= num_envs``. Windows may cross an episode end; the caller masks
+    with the stored ``terminated``/``truncated`` flags."""
+    L, B, E, T = sequence_length, batch_size, self.num_envs, self.buffer_size
+    dev = self.device
+    if L > self.num_transitions:
+      raise RuntimeError(f"sample_newest L={L} but only {self.num_transitions} filled")
+    env_idx = (
+      torch.randperm(E, device=dev)[:B]
+      if B <= E
+      else torch.randint(E, (B,), device=dev)
+    )
+    slot = (self._step - L + torch.arange(L, device=dev)) % T
+    return self._storage[env_idx[:, None], slot.expand(B, L)]
+
   def sample(self, sequence_length: int, batch_size: int) -> TensorDict:
     L, B, E, T = sequence_length, batch_size, self.num_envs, self.buffer_size
     dev, n = self.device, self.num_transitions

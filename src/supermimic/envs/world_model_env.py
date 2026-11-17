@@ -47,7 +47,14 @@ class WorldModelEnv(ABC):
     history_length: int,
     termination_softness: float,
     device: str = "cpu",
+    replay_horizon: int | None = None,
   ) -> None:
+    """``replay_horizon`` switches on the DMO arm: rollouts replay the newest
+    ``replay_horizon``-step simulator windows (see ``step``). None imagines
+    them with the model, as SuperMimic does."""
+    if replay_horizon is not None and history_length > 1:
+      raise ValueError("replay (states_from='sim') supports history_length=1 only")
+    self.replay_horizon = replay_horizon
     self.device = device
     self.dynamics = dynamics
     self.representation = representation
@@ -112,8 +119,16 @@ class WorldModelEnv(ABC):
     return self.get_observations()
 
   def step(
-    self, actions: torch.Tensor
+    self, actions: torch.Tensor, real: TensorDict | None = None
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
+    """``real`` is one step of a replayed window (``sample_initial_states`` in
+    replay mode). Where the current state is real, the logged noisy action
+    replaces the policy's value; where the next state is real, it replaces the
+    model's value. Both keep the gradient of what they replace, so the slope
+    is the model's and the number is the simulator's. After the window's
+    episode ends the rollout continues in imagination."""
+    if real is not None:
+      actions = _swap_value(actions, real["action"], real["is_real"])
     next_aux_state, next_rep_state, next_joint_state, term_prob, rewards = (
       self._wm_step(
         self.rep_state,
@@ -121,6 +136,7 @@ class WorldModelEnv(ABC):
         actions,
         self.last_actions,
         self.sim_ctx,
+        real,
       )
     )
     self.rep_state = next_rep_state
@@ -129,6 +145,15 @@ class WorldModelEnv(ABC):
     self.last_actions = actions
 
     self._compute_commands()
+    info: dict[str, object] = {}
+    if real is not None:
+      # Window alignment check: inside the episode the clip clock must match the
+      # simulator's. Logged instead of asserted; an assert would sync the host.
+      next_real = real["next_is_real"]
+      info["replay_time_mismatch"] = (
+        ((self.motion_times != real["motion_time"]) & next_real).float().mean()
+      )
+      info["replay_real_frac"] = next_real.float().mean()
 
     if self.history_length > 1:
       self._past_sensors = torch.cat(
@@ -136,7 +161,7 @@ class WorldModelEnv(ABC):
       )
     self._latest_sensor = self._synth_sensor()
 
-    return self.get_observations(), rewards, term_prob, {}
+    return self.get_observations(), rewards, term_prob, info
 
   def _synth_sensor(self) -> torch.Tensor:
     """Synthesize the actor's sensor from the current WM state."""
@@ -167,6 +192,7 @@ class WorldModelEnv(ABC):
     action: torch.Tensor,
     last_action: torch.Tensor,
     sim_ctx: torch.Tensor,
+    real: TensorDict | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
@@ -174,11 +200,21 @@ class WorldModelEnv(ABC):
     reward)``. ``action`` / ``last_action`` are raw policy outputs; Dynamics
     applies the scale/offset transform internally. Termination and reward both
     score the post-step state against the cached reference body state, the way
-    the simulator scores it before advancing the clip.
+    the simulator scores it before advancing the clip. With ``real`` (replay),
+    the simulator's next state replaces the prediction's value before anything
+    reads it.
     """
     next_aux_state, next_rep_state = self.dynamics(
       rep_state, action, aux_state, sim_ctx
     )
+    if real is not None:
+      sim_state, swap = real["state"], real["next_is_real"]
+      next_rep_state = _swap_value(
+        next_rep_state, self.representation.represent(sim_state), swap
+      )
+      next_aux_state = _swap_value(
+        next_aux_state, self.representation.extract_aux_state(sim_state), swap
+      )
     next_joint_state = self.representation.joint_state(next_rep_state)
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state
@@ -258,6 +294,8 @@ class WorldModelEnv(ABC):
     ``sensor_window`` holds the H sensor frames ending at the init state, and
     ``pad_mask`` flags its clamp-padded slots.
     """
+    if self.replay_horizon is not None:
+      return self._sample_replay_windows(self.replay_horizon)
     if self.history_length == 1:
       return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
     window, padded = self.replay_buffer.sample_causal(
@@ -266,6 +304,31 @@ class WorldModelEnv(ABC):
     batch = window[:, -1]
     batch["sensor_window"] = window["actor_obs"]
     batch["pad_mask"] = padded
+    return batch
+
+  def _sample_replay_windows(self, horizon: int) -> TensorDict:
+    """Start states for the DMO arm: frame 0 of each env's newest
+    ``horizon + 1`` frames, plus ``real`` (B, horizon) holding step ``k``'s
+    logged action, the stored next state and clip time, and two masks.
+    ``is_real[k]``: state ``k`` is the simulator's. ``next_is_real[k]``: state
+    ``k + 1`` is too, i.e. no episode ended at frames ``0..k``. The buffer
+    stores the post-reset state after a done, so the terminal state itself is
+    never available and the step that ends an episode is predicted."""
+    window = self.replay_buffer.sample_newest(horizon + 1, self.num_envs)
+    ended = (window["terminated"] | window["truncated"])[:, :-1]
+    next_is_real = ended.long().cumsum(1) == 0
+    is_real = torch.cat([torch.ones_like(next_is_real[:, :1]), next_is_real[:, :-1]], 1)
+    batch = window[:, 0]
+    batch["real"] = TensorDict(
+      {
+        "action": window["action"][:, :-1],
+        "state": window["state"][:, 1:],
+        "motion_time": window["motion_time"][:, 1:],
+        "is_real": is_real,
+        "next_is_real": next_is_real,
+      },
+      batch_size=[self.num_envs, horizon],
+    )
     return batch
 
   def _warmstart_past_sensors(
@@ -288,3 +351,12 @@ class WorldModelEnv(ABC):
     aux_state = self.representation.extract_aux_state(full_states)
     rep_state = self.representation.represent(full_states)
     return aux_state.detach(), rep_state.detach()
+
+
+def _swap_value(
+  x: torch.Tensor, value: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+  """Where ``mask`` (batch-shaped), take ``value``'s number and keep ``x``'s
+  gradient (straight-through); elsewhere ``x`` unchanged."""
+  swapped = x + (value - x).detach()
+  return torch.where(mask.unsqueeze(-1), swapped, x)

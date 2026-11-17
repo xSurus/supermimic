@@ -101,11 +101,18 @@ class BpttPolicyLearner:
     """Imagine one rollout from ``start`` and take one actor step on its return."""
     cfg = self.cfg
     obs = self.wm_env.reset(start)
+    real = start.get("real", None)  # replayed simulator window (DMO arm)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     rollout: list[TensorDict] = []
+    replay_stats: dict[str, torch.Tensor] = {}
     for t in range(cfg.horizon):
       actions = self._rollout_actor(obs)
-      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      if real is None:
+        next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      else:
+        next_obs, reward, term_prob, info = self.wm_env.step(actions, real[:, t])
+        for k, v in info.items():
+          replay_stats[k] = replay_stats.get(k, 0.0) + v / cfg.horizon
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())
       ret = ret + cfg.gamma**t * survival * reward
@@ -121,6 +128,7 @@ class BpttPolicyLearner:
     return {
       "return": ret.mean().detach(),
       "grad_norm": grad_norm,
+      **replay_stats,
       **self._fit_critic(rollout, obs),
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
