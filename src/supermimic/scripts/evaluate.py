@@ -12,13 +12,16 @@ from typing import Any
 import mjlab.tasks  # noqa: F401
 import torch
 import tyro
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from mjlab.utils.wrappers import VideoRecorder
 
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
-from supermimic.scripts.train_utils import create_env, setup_device
+from supermimic.scripts.train_utils import setup_device
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.utils.wandb_artifacts import download_artifact_cached
 
@@ -32,6 +35,11 @@ class EvaluateConfig:
   output_file: str | None = None
   device: str | None = None
   seed: int = 0
+  video: bool = False
+  """Save an MP4 of the first clip to ``videos/``. Pass one clip in
+  ``--motion-file`` to choose which. On Colab set ``MUJOCO_GL=egl``."""
+  video_length: int = 1000
+  """Frames to record (50 per second). Frames are held in memory until saved."""
 
 
 def reward_ceiling(step_dt: float, rewards: Any) -> float:
@@ -87,7 +95,20 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   env_cfg.seed = cfg.seed
   command_term.sampling_mode = "external"
 
-  env = create_env(env_cfg, num_clips, device)
+  env_cfg.scene.num_envs = num_clips
+  base = ManagerBasedRlEnv(
+    cfg=env_cfg, device=device, render_mode="rgb_array" if cfg.video else None
+  )
+  if cfg.video:
+    base = VideoRecorder(
+      base,
+      video_folder="videos",
+      step_trigger=lambda step: step == 0,
+      video_length=cfg.video_length,
+      disable_logger=True,
+    )
+    print(f"[INFO] Recording {cfg.video_length} frames of clip 0 to videos/")
+  env = RslRlVecEnvWrapper(base)
   cmd = env.unwrapped.command_manager.get_term("motion")
   motion = cmd.motion
   ends = motion.motion_ends.to(device)
