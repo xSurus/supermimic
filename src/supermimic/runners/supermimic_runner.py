@@ -90,6 +90,11 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   Jacobians (DMO). 'model-fresh': DMO's start states (each env's newest window)
   imagined with the model, the control separating fresh starts from simulator
   states. Fixed for a run: the policy update is a captured CUDA graph."""
+  dmo_hold: int = 0
+  """With states_from='sim': if > 0, hold policy updates and run this many after
+  every horizon + 1 collected steps, so the first update of each block replays
+  windows collected entirely by the current policy. World model updates keep
+  their usual schedule. 0 runs policy updates on the usual schedule."""
 
   sampling_mode: Literal["uniform", "adaptive", "start", "return"] = "return"
   """RSI reset distribution: 'return' (concentrate resets on the bins where the
@@ -211,6 +216,12 @@ def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> N
   wm.load_bundle(
     torch.load(download_model_dir(run) / "world_model.pt", map_location=device)
   )
+
+
+def on_policy_block(step: int, horizon: int) -> bool:
+  """True on the loop steps where every action in each env's newest
+  ``horizon + 1`` stored frames was taken after the previous True step."""
+  return (step + 1) % (horizon + 1) == 0
 
 
 class Ratio:
@@ -681,6 +692,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     if self.cfg.states_from != "model":
       min_fill = max(min_fill, self.cfg.policy.horizon + 1)
 
+    if self.cfg.dmo_hold and self.cfg.states_from != "sim":
+      raise ValueError("dmo_hold needs states_from='sim'")
+
+    def update_policy() -> None:
+      nonlocal policy_learn_time
+      start_policy_time = time.time()
+      loss_dict.update(self.policy_learner.update())
+      policy_learn_time += time.time() - start_policy_time
+
     num_collected_steps = 0
     start_time = time.time()
     wm_learn_time = 0.0
@@ -706,12 +726,17 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         wm_logs = self.world_model_learner.update(data)
         wm_learn_time += time.time() - start_wm_time
 
-        start_policy_time = time.time()
-        policy_logs = self.policy_learner.update()
-        policy_learn_time += time.time() - start_policy_time
-
         loss_dict.update(wm_logs)
-        loss_dict.update(policy_logs)
+        if not self.cfg.dmo_hold:
+          update_policy()
+
+      if (
+        self.cfg.dmo_hold
+        and on_policy_block(step, self.cfg.policy.horizon)
+        and self.replay_buffer.num_transitions >= min_fill
+      ):
+        for _ in range(self.cfg.dmo_hold):
+          update_policy()
 
       if step % self.cfg.log_interval == 0:
         elapsed_time = time.time() - start_time

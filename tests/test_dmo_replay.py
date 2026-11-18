@@ -123,3 +123,17 @@ def test_model_fresh_starts_at_the_window_start_without_replay():
   assert "real" not in start.keys()
   # Same start frame as the DMO arm: the oldest of the newest H + 1 frames.
   assert (start["state"][:, 0] == 5 - (H + 1)).all()
+
+
+def test_on_policy_blocks_replay_only_actions_taken_since_the_last_block():
+  from supermimic.runners.supermimic_runner import on_policy_block
+
+  for horizon in (3, 32):
+    last = -1
+    for step in range(10 * (horizon + 1)):
+      if on_policy_block(step, horizon):
+        # The newest horizon + 1 frames end at `step`; their transitions use the
+        # actions taken at steps step - horizon .. step - 1.
+        assert step - horizon == last + 1
+        last = step
+    assert last > 0
