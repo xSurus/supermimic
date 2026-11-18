@@ -38,6 +38,9 @@ class EvaluateConfig:
   video: bool = False
   """Save an MP4 of the first clip to ``videos/``. Pass one clip in
   ``--motion-file`` to choose which. On Colab set ``MUJOCO_GL=egl``."""
+  randomize: bool = False
+  """Keep the training domain randomization. Off by default: the paper evaluates
+  with foot friction 1.0, no CoM offset and no encoder bias (appendix F)."""
   video_length: int = 1000
   """Frames to record (50 per second). Frames are held in memory until saved."""
 
@@ -54,6 +57,13 @@ def normalized_return(reward_sum: float, max_step: float, clip_len: int) -> floa
 def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   device = setup_device(cfg.device)
   env_cfg = load_env_cfg(task_id, play=False)
+  if not cfg.randomize:
+    # Pinned, not removed: removing an event would change the sim context layout
+    # the world model was trained on.
+    events = env_cfg.events
+    events["foot_friction"].params["ranges"] = (1.0, 1.0)
+    events["base_com"].params["ranges"] = {i: (0.0, 0.0) for i in range(3)}
+    events["encoder_bias"].params["bias_range"] = (0.0, 0.0)
 
   import wandb
 
