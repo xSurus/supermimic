@@ -114,3 +114,12 @@ def test_replay_takes_values_from_the_sim_and_slope_from_the_model():
   # Each reward's slope in the model weight is the action it was fed: logged
   # stamps 1, 2, 3 for the 3 real envs, logged 1, 2 then 0 for env 0.
   assert weight.grad.item() == pytest.approx(3 * (1 + 2 + 3) + (1 + 2 + 0))
+
+
+def test_model_fresh_starts_at_the_window_start_without_replay():
+  env = _env(_buffer(steps=5), torch.tensor(1.0))
+  env.replay_states = False
+  start = env.sample_initial_states()
+  assert "real" not in start.keys()
+  # Same start frame as the DMO arm: the oldest of the newest H + 1 frames.
+  assert (start["state"][:, 0] == 5 - (H + 1)).all()

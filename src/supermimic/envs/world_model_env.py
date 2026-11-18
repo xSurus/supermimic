@@ -48,13 +48,16 @@ class WorldModelEnv(ABC):
     termination_softness: float,
     device: str = "cpu",
     replay_horizon: int | None = None,
+    replay_states: bool = True,
   ) -> None:
     """``replay_horizon`` switches on the DMO arm: rollouts replay the newest
     ``replay_horizon``-step simulator windows (see ``step``). None imagines
-    them with the model, as SuperMimic does."""
+    them with the model, as SuperMimic does. ``replay_states=False`` keeps the
+    newest-window start states but imagines the rollout (the control arm)."""
     if replay_horizon is not None and history_length > 1:
       raise ValueError("replay (states_from='sim') supports history_length=1 only")
     self.replay_horizon = replay_horizon
+    self.replay_states = replay_states
     self.device = device
     self.dynamics = dynamics
     self.representation = representation
@@ -295,7 +298,10 @@ class WorldModelEnv(ABC):
     ``pad_mask`` flags its clamp-padded slots.
     """
     if self.replay_horizon is not None:
-      return self._sample_replay_windows(self.replay_horizon)
+      batch = self._sample_replay_windows(self.replay_horizon)
+      if not self.replay_states:
+        del batch["real"]
+      return batch
     if self.history_length == 1:
       return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
     window, padded = self.replay_buffer.sample_causal(

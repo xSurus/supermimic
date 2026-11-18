@@ -38,6 +38,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     termination_softness: float,
     device: str = "cpu",
     replay_horizon: int | None = None,
+    replay_states: bool = True,
   ) -> None:
     self.task_specs = task_specs
     assert task_specs[0].name == "motion", "task_specs[0] must be the motion task"
@@ -51,6 +52,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       termination_softness=termination_softness,
       device=device,
       replay_horizon=replay_horizon,
+      replay_states=replay_states,
     )
 
   def _build_task_goals(self) -> None:

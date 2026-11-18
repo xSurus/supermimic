@@ -84,10 +84,12 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   )
   """Fractional slot allocation per task. Must sum to 1.0."""
   policy: BpttCfg | ActorCriticCfg = field(default_factory=ActorCriticCfg)
-  states_from: Literal["model", "sim"] = "model"
+  states_from: Literal["model", "sim", "model-fresh"] = "model"
   """Where rollout states come from. 'model': imagined from random buffer
   states (SuperMimic). 'sim': the newest simulator windows replayed with model
-  Jacobians (DMO). Fixed for a run: the policy update is a captured CUDA graph."""
+  Jacobians (DMO). 'model-fresh': DMO's start states (each env's newest window)
+  imagined with the model, the control separating fresh starts from simulator
+  states. Fixed for a run: the policy update is a captured CUDA graph."""
 
   sampling_mode: Literal["uniform", "adaptive", "start", "return"] = "return"
   """RSI reset distribution: 'return' (concentrate resets on the bins where the
@@ -537,7 +539,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
-      replay_horizon=policy_cfg.horizon if self.cfg.states_from == "sim" else None,
+      replay_horizon=policy_cfg.horizon if self.cfg.states_from != "model" else None,
+      replay_states=self.cfg.states_from == "sim",
     )
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
@@ -675,7 +678,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     # Replay needs a full window per env before the first policy update.
     min_fill = self.cfg.wm.horizon
-    if self.cfg.states_from == "sim":
+    if self.cfg.states_from != "model":
       min_fill = max(min_fill, self.cfg.policy.horizon + 1)
 
     num_collected_steps = 0
