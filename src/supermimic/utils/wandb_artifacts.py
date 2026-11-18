@@ -62,7 +62,7 @@ def _version_index(artifact: Any) -> int:
 
 
 def log_model_artifact(
-  files: list[str], keep_last: int = 5, milestone_every: int = 25
+  files: list[str], keep_last: int = 5, milestone_every: int = 5
 ) -> None:
   """Log ``files`` as a new version of the run's ``model`` checkpoint artifact.
 
