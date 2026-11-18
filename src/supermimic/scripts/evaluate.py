@@ -185,7 +185,9 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
     "failed_clips": failed_clips,
   }
   if cfg.output_file:
-    Path(cfg.output_file).write_text(json.dumps(results, indent=2))
+    out = Path(cfg.output_file)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(results, indent=2))
     print(f"[INFO] Wrote {cfg.output_file}")
   env.close()
   return results
