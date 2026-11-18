@@ -91,10 +91,11 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   imagined with the model, the control separating fresh starts from simulator
   states. Fixed for a run: the policy update is a captured CUDA graph."""
   dmo_hold: int = 0
-  """With states_from='sim': if > 0, hold policy updates and run this many after
-  every horizon + 1 collected steps, so the first update of each block replays
-  windows collected entirely by the current policy. World model updates keep
-  their usual schedule. 0 runs policy updates on the usual schedule."""
+  """With states_from='sim' or 'model-fresh': if > 0, hold policy updates and
+  run this many after every horizon + 1 collected steps, so the first update of
+  each block starts from windows collected entirely by the current policy.
+  World model updates keep their usual schedule. 0 runs policy updates on the
+  usual schedule."""
 
   sampling_mode: Literal["uniform", "adaptive", "start", "return"] = "return"
   """RSI reset distribution: 'return' (concentrate resets on the bins where the
@@ -692,8 +693,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     if self.cfg.states_from != "model":
       min_fill = max(min_fill, self.cfg.policy.horizon + 1)
 
-    if self.cfg.dmo_hold and self.cfg.states_from != "sim":
-      raise ValueError("dmo_hold needs states_from='sim'")
+    if self.cfg.dmo_hold and self.cfg.states_from == "model":
+      raise ValueError("dmo_hold needs states_from='sim' or 'model-fresh'")
 
     def update_policy() -> None:
       nonlocal policy_learn_time

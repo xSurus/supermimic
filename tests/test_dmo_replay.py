@@ -103,6 +103,9 @@ def test_replay_takes_values_from_the_sim_and_slope_from_the_model():
     _, reward, _, info = env.step(policy_action, real[:, t])
     total = total + reward.sum()
     assert info["replay_time_mismatch"] == 0.0
+    if t == 0:
+      # Policy action 0 against logged action 1 on every (real) row.
+      assert info["replay_action_gap"] == 1.0
   env0 = (real["next_is_real"][:, -1] == 0).nonzero().item()
   others = [i for i in range(E) if i != env0]
   assert (real["next_is_real"][env0] == torch.tensor([True, False, False])).all()

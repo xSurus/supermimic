@@ -130,8 +130,14 @@ class WorldModelEnv(ABC):
     model's value. Both keep the gradient of what they replace, so the slope
     is the model's and the number is the simulator's. After the window's
     episode ends the rollout continues in imagination."""
+    info: dict[str, object] = {}
     if real is not None:
-      actions = _swap_value(actions, real["action"], real["is_real"])
+      # Policy drift since collection: the logged action is the old policy plus
+      # noise, so with no drift this equals the collection noise variance.
+      is_real = real["is_real"]
+      gap = (real["action"] - actions.detach()).pow(2).mean(-1)
+      info["replay_action_gap"] = (gap * is_real).sum() / is_real.sum().clamp(min=1)
+      actions = _swap_value(actions, real["action"], is_real)
     next_aux_state, next_rep_state, next_joint_state, term_prob, rewards = (
       self._wm_step(
         self.rep_state,
@@ -148,7 +154,6 @@ class WorldModelEnv(ABC):
     self.last_actions = actions
 
     self._compute_commands()
-    info: dict[str, object] = {}
     if real is not None:
       # Window alignment check: inside the episode the clip clock must match the
       # simulator's. Logged instead of asserted; an assert would sync the host.

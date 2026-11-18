@@ -28,6 +28,9 @@ class BpttPolicyLearnerCfg:
   survival_masking: bool = True
   beta2: float = 0.95  # faster Adam EMA recovery after gradient spikes
   grad_clip_value: float = 0.1  # per-parameter gradient element clipping
+  imagine_noise: float = 0.0
+  """Std of Gaussian noise added to imagined actions. 0 is SuperMimic. Set it to
+  ``noise`` to give a model-state arm the same noisy actions DMO replays."""
 
 
 @dataclass
@@ -107,6 +110,8 @@ class BpttPolicyLearner:
     replay_stats: dict[str, torch.Tensor] = {}
     for t in range(cfg.horizon):
       actions = self._rollout_actor(obs)
+      if cfg.imagine_noise:
+        actions = actions + torch.randn_like(actions) * cfg.imagine_noise
       if real is None:
         next_obs, reward, term_prob, _ = self.wm_env.step(actions)
       else:
