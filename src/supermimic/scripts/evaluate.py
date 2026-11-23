@@ -125,8 +125,13 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   if len(ends) != num_clips:
     raise RuntimeError(f"expected {num_clips} clips, motion loader has {len(ends)}")
   starts = torch.cat([ends.new_zeros(1), ends[:-1]])
+
   # ponytail: overrides a private MotionCommand method; breaks if mjlab renames it.
-  cmd._external_sampling = lambda env_ids: starts[env_ids]
+  def start_of_own_clip(env_ids: torch.Tensor, probs: torch.Tensor) -> None:
+    del probs  # external mode's bin distribution, unused here
+    cmd.time_steps[env_ids] = starts[env_ids]
+
+  cmd._sample_bins = start_of_own_clip
 
   wm = build_world_model(runner_cfg, env, device)
   representation = wm.representation

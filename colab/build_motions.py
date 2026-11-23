@@ -3,16 +3,37 @@
 import argparse
 from pathlib import Path
 
+import mujoco
 import numpy as np
 import torch
+from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 from mjlab.scripts.csv_to_npz import MotionLoader
 
 
+def g1_joint_names() -> list[str]:
+  """The G1's hinge joints in model order, the column order of the CSVs."""
+  m = mujoco.MjModel.from_xml_path(str(G1_XML))
+  free = mujoco.mjtJoint.mjJNT_FREE
+  return [m.joint(i).name for i in range(m.njnt) if m.jnt_type[i] != free]
+
+
 def convert(csv: Path, out: Path, device: str) -> None:
-  loader = MotionLoader(str(csv), input_fps=30.0, output_fps=50.0, device=device)
+  names = g1_joint_names()
+  m = MotionLoader(str(csv), names, input_fps=30.0, output_fps=50.0, device=device)
+  # The fields csv_to_npz.main writes.
+  arrays = {
+    "fps": np.array([m.output_fps]),
+    "joint_names": np.array(names),
+    "joint_pos": m.motion_dof_poss.cpu().numpy(),
+    "joint_vel": m.motion_dof_vels.cpu().numpy(),
+    "root_pos_w": m.motion_base_poss.cpu().numpy(),
+    "root_quat_w": m.motion_base_rots.cpu().numpy(),
+    "root_lin_vel_w": m.motion_base_lin_vels.cpu().numpy(),
+    "root_ang_vel_w": m.motion_base_ang_vels.cpu().numpy(),
+  }
   tmp = out.with_suffix(".tmp")
   with open(tmp, "wb") as f:
-    np.savez(f, **loader.arrays())
+    np.savez(f, **arrays)
   tmp.replace(out)
 
 
