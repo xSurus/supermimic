@@ -243,8 +243,13 @@ def grad_trust(task_id: str, cfg: GradTrustConfig) -> dict:
     "eps": cfg.eps,
     **{s: summarize(r["norm"], r["trust"], r["value"]) for s, r in per_source.items()},
   }
-  for source in per_source:
-    print(f"\n{source} states: median trust {results[source]['median_trust']:.3f}")
+  for source, r in per_source.items():
+    # With --eps 0 this is the noise floor between copies; see trust_at_starts.
+    results[source]["median_abs_d_ret"] = float(r["d_ret"].abs().median())
+    print(
+      f"\n{source} states: median trust {results[source]['median_trust']:.3f}, "
+      f"median |J+ - J-| {results[source]['median_abs_d_ret']:.2e}"
+    )
     for band, row in results[source]["bands"].items():
       trust = "-" if row["trust"] is None else f"{row['trust']:.3f}"
       print(f"  {band:>8} medians  n={row['n']:5d}  trust={trust}")
