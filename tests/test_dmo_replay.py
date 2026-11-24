@@ -94,10 +94,9 @@ def test_replay_takes_values_from_the_sim_and_slope_from_the_model():
   total = 0.0
   for t in range(H):
     policy_action = torch.zeros(E, ACTION_DIM, requires_grad=True)
-    gap = (real["action"][:, t] - policy_action.detach()).pow(2).mean(-1)
     _, reward, _ = env.step(policy_action, real[:, t])
     total = total + reward.sum()
-    stats = replay_step_stats(real[:, t], gap, env.motion_times)
+    stats = replay_step_stats(real[:, t], policy_action, env.motion_times)
     assert stats["replay_time_mismatch"] == 0.0
     if t == 0:
       # Policy action 0 against logged action 1 on every (real) row.

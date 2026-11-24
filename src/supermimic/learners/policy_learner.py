@@ -61,8 +61,17 @@ def gae_returns(
   return returns
 
 
+def cap_weights(G: torch.Tensor, k: float) -> torch.Tensor:
+  """Per-rollout weights that cap each norm in ``G`` at ``k`` batch medians. A
+  zero median (most rollouts without gradient) caps nothing, rather than
+  zeroing every rollout that has one."""
+  median = G.median()
+  w = (k * median / G.clamp_min(1e-12)).clamp(max=1.0)
+  return torch.where(median > 0, w, torch.ones_like(w))
+
+
 def replay_step_stats(
-  real: TensorDict, action_gap: torch.Tensor, motion_times: torch.Tensor
+  real: TensorDict, actions: torch.Tensor, motion_times: torch.Tensor
 ) -> dict[str, torch.Tensor]:
   """Checks on one replayed step. ``replay_action_gap``: mean squared gap between
   the logged and current actions over real states, the policy drift since
@@ -70,6 +79,7 @@ def replay_step_stats(
   from the simulator's inside the episode; must be 0 (logged, not asserted: an
   assert would sync the host). ``replay_real_frac``: share of real next states."""
   is_real, next_real = real["is_real"], real["next_is_real"]
+  action_gap = (real["action"] - actions.detach()).pow(2).mean(-1)
   mismatch = (motion_times != real["motion_time"]) & next_real
   return {
     "replay_action_gap": (action_gap * is_real).sum() / is_real.sum().clamp(min=1),
@@ -116,26 +126,27 @@ class BpttPolicyLearner:
     reward = totals.pop("return") / self.cfg.horizon / n / self.wm_env.representation.dt
     return {"Policy/reward": reward} | {f"Policy/{k}": v / n for k, v in totals.items()}
 
-  def _train_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
-    """Imagine one rollout from ``start`` and take one actor step on its return."""
+  def rollout(self, start: TensorDict) -> tuple:
+    """Imagine one rollout from ``start``. Returns ``(ret, aux_loss, taken,
+    rollout, last_obs, replay_stats)``: the per-rollout return with its
+    bootstrap, the actor's auxiliary loss, each step's ``(obs, action)``, the
+    detached steps for the critic, the last observation and the DMO checks."""
     cfg = self.cfg
     obs = self.wm_env.reset(start)
     real = start.get("real", None)  # replayed simulator window (DMO arm)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     rollout: list[TensorDict] = []
     replay_stats: dict[str, torch.Tensor] = {}
-    taken: list[tuple[TensorDict, torch.Tensor]] = []  # (obs, action) for the cap
+    taken: list[tuple[TensorDict, torch.Tensor]] = []
     for t in range(cfg.horizon):
       with torch.autocast("cuda", torch.bfloat16, enabled=obs.is_cuda):
         actions = self._rollout_actor(obs).float()
-      if cfg.rollout_cap:
-        taken.append((obs.detach(), actions))
+      taken.append((obs.detach(), actions))
       if real is None:
         next_obs, reward, term_prob = self.wm_env.step(actions)
       else:
-        gap = (real["action"][:, t] - actions.detach()).pow(2).mean(-1)
         next_obs, reward, term_prob = self.wm_env.step(actions, real[:, t])
-        stats = replay_step_stats(real[:, t], gap, self.wm_env.motion_times)
+        stats = replay_step_stats(real[:, t], actions, self.wm_env.motion_times)
         for k, v in stats.items():
           replay_stats[k] = replay_stats.get(k, 0.0) + v / cfg.horizon
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
@@ -146,6 +157,12 @@ class BpttPolicyLearner:
         survival = survival * (1 - term_prob)
       obs = next_obs
     ret = ret + self._bootstrap(obs, survival, term_prob)
+    return ret, aux_loss, taken, rollout, obs, replay_stats
+
+  def _train_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
+    """Imagine one rollout from ``start`` and take one actor step on its return."""
+    cfg = self.cfg
+    ret, aux_loss, taken, rollout, obs, replay_stats = self.rollout(start)
     cap_stats: dict[str, torch.Tensor] = {}
     if cfg.rollout_cap:
       loss, cap_stats = self._capped_loss(ret, taken)
@@ -175,7 +192,7 @@ class BpttPolicyLearner:
     g = torch.autograd.grad(ret.sum(), actions)
     G = torch.stack([gt.pow(2).sum(-1) for gt in g]).sum(0).sqrt()
     median = G.median()
-    w = (self.cfg.rollout_cap * median / G.clamp_min(1e-12)).clamp(max=1.0)
+    w = cap_weights(G, self.cfg.rollout_cap)
     surrogate, aux_loss = 0.0, 0.0
     for gt, o in zip(g, obs, strict=True):
       with torch.autocast("cuda", torch.bfloat16, enabled=o.is_cuda):

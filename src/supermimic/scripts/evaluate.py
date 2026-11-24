@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import glob
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +14,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from mjlab.tasks.tracking.mdp.commands import resolve_motion_file
 from mjlab.utils.wrappers import VideoRecorder
 
 import supermimic.tasks  # noqa: F401
@@ -81,13 +80,7 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
   if cfg.motion_file is not None:
-    expanded = os.path.expanduser(cfg.motion_file)
-    if any(c in expanded for c in "*?[]"):
-      files = sorted(glob.glob(expanded))
-    else:
-      files = [expanded]
-    if not files:
-      raise ValueError(f"No motion files matched: {cfg.motion_file}")
+    files = resolve_motion_file(cfg.motion_file)
   else:
     artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
     if not artifacts:
@@ -196,9 +189,7 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
         "index": i,
         "clip": motion.motion_names[i],
         "frames": frames,
-        "normalized_return": normalized_return(
-          float(reward_sum[i]), max_step, frames - 1
-        ),
+        "normalized_return": normalized_return(float(reward_sum[i]), max_step, frames),
         "fell": bool(fell[i]),
       }
     )

@@ -8,6 +8,7 @@ from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearnerCfg,
   BpttPolicyLearner,
   BpttPolicyLearnerCfg,
+  cap_weights,
   gae_returns,
 )
 
@@ -152,6 +153,14 @@ def test_rollout_cap_that_never_binds_matches_the_uncapped_update():
 def test_rollout_cap_scales_down_only_the_outlier_rollout():
   _, stats = _capped_update(2.0, [0.1, 0.1, 0.1, 10.0])
   assert stats["Policy/cap_frac"] == pytest.approx(0.25)
+
+
+def test_cap_weights_scale_outliers_and_skip_a_zero_median():
+  w = cap_weights(torch.tensor([1.0, 1.0, 1.0, 50.0]), 10.0)
+  assert torch.allclose(w, torch.tensor([1.0, 1.0, 1.0, 0.2]))
+  assert torch.equal(
+    cap_weights(torch.tensor([0.0, 0.0, 0.0, 5.0]), 10.0), torch.ones(4)
+  )
 
 
 def test_gae_returns_discount_by_soft_done():

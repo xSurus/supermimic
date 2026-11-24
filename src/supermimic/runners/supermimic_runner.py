@@ -616,10 +616,16 @@ class SuperMimicRunner:
       raise ValueError("states_from='sim'/'model-fresh' supports history_length=1")
     if self.cfg.dmo_hold and not replay:
       raise ValueError("dmo_hold needs states_from='sim' or 'model-fresh'")
-    # Replay needs a full window per env before the first policy update.
-    min_fill = self.cfg.wm.horizon
+    # Replay needs a full window per env before the first policy update. World
+    # model updates keep the baseline's schedule either way.
+    policy_fill = self.cfg.wm.horizon
     if replay:
-      min_fill = max(min_fill, policy_cfg.horizon + 1)
+      policy_fill = max(policy_fill, policy_cfg.horizon + 1)
+    if policy_fill > self.cfg.buffer_size:
+      raise ValueError(
+        f"buffer_size {self.cfg.buffer_size} cannot hold the {policy_fill} frames "
+        "a policy update needs"
+      )
 
     def policy_start() -> TensorDict:
       if replay:
@@ -653,7 +659,7 @@ class SuperMimicRunner:
       num_collected_steps += self.step()
 
       for _ in range(should_train(step)):
-        if self.replay_buffer.num_transitions < min_fill:
+        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
           continue
 
         data = (
@@ -666,13 +672,13 @@ class SuperMimicRunner:
         wm_learn_time += time.time() - start_wm_time
 
         loss_dict.update(wm_logs)
-        if not self.cfg.dmo_hold:
+        if not self.cfg.dmo_hold and self.replay_buffer.num_transitions >= policy_fill:
           update_policy()
 
       if (
         self.cfg.dmo_hold
         and on_policy_block(step, policy_cfg.horizon)
-        and self.replay_buffer.num_transitions >= min_fill
+        and self.replay_buffer.num_transitions >= policy_fill
       ):
         for _ in range(self.cfg.dmo_hold):
           update_policy()

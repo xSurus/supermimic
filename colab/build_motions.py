@@ -1,6 +1,7 @@
 """Convert retargeted LAFAN1 CSVs to npz with the official converter, saved locally."""
 
 import argparse
+import functools
 from pathlib import Path
 
 import mujoco
@@ -10,6 +11,7 @@ from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 from mjlab.scripts.csv_to_npz import MotionLoader
 
 
+@functools.cache
 def g1_joint_names() -> list[str]:
   """The G1's hinge joints in model order, the column order of the CSVs."""
   m = mujoco.MjModel.from_xml_path(str(G1_XML))
