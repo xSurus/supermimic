@@ -82,13 +82,30 @@ class WorldModelEnv:
     return self.get_observations()
 
   def step(
-    self, actions: torch.Tensor
+    self, actions: torch.Tensor, real: TensorDict | None = None
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor]:
     """Advance one step. Termination and reward score the post-step state against
-    the pre-step reference frame, as the simulator does before advancing the clip."""
+    the pre-step reference frame, as the simulator does before advancing the clip.
+
+    ``real`` is one step of a replayed simulator window (``sample_replay_window``,
+    the DMO arm). Where the current state is real, the logged action replaces the
+    policy's value; where the next state is real, it replaces the model's value.
+    Both keep the gradient of what they replace, so the slope is the model's and
+    the number is the simulator's. After the window's episode ends the rollout
+    continues in imagination."""
+    if real is not None:
+      actions = _swap_value(actions, real["action"], real["is_real"])
     self.aux_state, self.rep_state = self.dynamics(
       self.rep_state, actions, self.aux_state, self.sim_ctx
     )
+    if real is not None:
+      sim_state, swap = real["state"], real["next_is_real"]
+      self.rep_state = _swap_value(
+        self.rep_state, self.representation.represent(sim_state), swap
+      )
+      self.aux_state = _swap_value(
+        self.aux_state, self.representation.extract_aux_state(sim_state), swap
+      )
     self.joint_state = self.representation.joint_state(self.rep_state)
     term_prob = self._compute_term_prob(self.aux_state, *self._ref_body_state[:2])
     rewards = self.representation.compute_wm_reward_from_reference(
@@ -192,3 +209,43 @@ def sample_start(
     return buffer.sample(1, batch_size).squeeze(1)
   window, padded = buffer.sample_causal(history_length, batch_size)
   return window[:, -1].set("sensor_window", window["actor_obs"]).set("pad_mask", padded)
+
+
+def sample_replay_window(
+  buffer: ReplayBuffer, horizon: int, batch_size: int, replay_states: bool = True
+) -> TensorDict:
+  """Start states for the DMO arms (history_length 1): frame 0 of each env's newest
+  ``horizon + 1`` frames. With ``replay_states`` (DMO) it carries ``real``
+  (B, horizon): step ``k``'s logged action, the stored next state and clip time,
+  and two masks. ``is_real[k]``: state ``k`` is the simulator's.
+  ``next_is_real[k]``: state ``k + 1`` is too, i.e. no episode ended at frames
+  ``0..k``. The buffer stores the post-reset state after a done, so the terminal
+  state itself is never available and the step that ends an episode is predicted.
+  Without ``replay_states`` (model-fresh) the rollout from that start is imagined."""
+  window = buffer.sample_newest(horizon + 1, batch_size)
+  start = window[:, 0]
+  if not replay_states:
+    return start
+  ended = (window["terminated"] | window["truncated"])[:, :-1]
+  next_is_real = ended.long().cumsum(1) == 0
+  is_real = torch.cat([torch.ones_like(next_is_real[:, :1]), next_is_real[:, :-1]], 1)
+  real = TensorDict(
+    {
+      "action": window["action"][:, :-1],
+      "state": window["state"][:, 1:],
+      "motion_time": window["motion_time"][:, 1:],
+      "is_real": is_real,
+      "next_is_real": next_is_real,
+    },
+    batch_size=[batch_size, horizon],
+  )
+  return start.set("real", real)
+
+
+def _swap_value(
+  x: torch.Tensor, value: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+  """Where ``mask`` (batch-shaped), take ``value``'s number and keep ``x``'s
+  gradient (straight-through); elsewhere ``x`` unchanged."""
+  swapped = x + (value - x).detach()
+  return torch.where(mask.unsqueeze(-1), swapped, x)

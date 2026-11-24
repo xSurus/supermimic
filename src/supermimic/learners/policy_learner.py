@@ -58,6 +58,23 @@ def gae_returns(
   return returns
 
 
+def replay_step_stats(
+  real: TensorDict, action_gap: torch.Tensor, motion_times: torch.Tensor
+) -> dict[str, torch.Tensor]:
+  """Checks on one replayed step. ``replay_action_gap``: mean squared gap between
+  the logged and current actions over real states, the policy drift since
+  collection. ``replay_time_mismatch``: share of envs whose clip clock differs
+  from the simulator's inside the episode; must be 0 (logged, not asserted: an
+  assert would sync the host). ``replay_real_frac``: share of real next states."""
+  is_real, next_real = real["is_real"], real["next_is_real"]
+  mismatch = (motion_times != real["motion_time"]) & next_real
+  return {
+    "replay_action_gap": (action_gap * is_real).sum() / is_real.sum().clamp(min=1),
+    "replay_time_mismatch": mismatch.float().mean(),
+    "replay_real_frac": next_real.float().mean(),
+  }
+
+
 class BpttPolicyLearner:
   """Policy Learner using direct Backpropagation Through Time (BPTT)."""
 
@@ -100,12 +117,21 @@ class BpttPolicyLearner:
     """Imagine one rollout from ``start`` and take one actor step on its return."""
     cfg = self.cfg
     obs = self.wm_env.reset(start)
+    real = start.get("real", None)  # replayed simulator window (DMO arm)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     rollout: list[TensorDict] = []
+    replay_stats: dict[str, torch.Tensor] = {}
     for t in range(cfg.horizon):
       with torch.autocast("cuda", torch.bfloat16, enabled=obs.is_cuda):
         actions = self._rollout_actor(obs).float()
-      next_obs, reward, term_prob = self.wm_env.step(actions)
+      if real is None:
+        next_obs, reward, term_prob = self.wm_env.step(actions)
+      else:
+        gap = (real["action"][:, t] - actions.detach()).pow(2).mean(-1)
+        next_obs, reward, term_prob = self.wm_env.step(actions, real[:, t])
+        stats = replay_step_stats(real[:, t], gap, self.wm_env.motion_times)
+        for k, v in stats.items():
+          replay_stats[k] = replay_stats.get(k, 0.0) + v / cfg.horizon
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())
       ret = ret + cfg.gamma**t * survival * reward
@@ -121,6 +147,7 @@ class BpttPolicyLearner:
     return {
       "return": ret.mean().detach(),
       "grad_norm": grad_norm,
+      **replay_stats,
       **self._fit_critic(rollout, obs),
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }

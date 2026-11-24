@@ -12,7 +12,11 @@ import tyro
 import wandb
 from tensordict import TensorDict
 
-from supermimic.envs.world_model_env import WorldModelEnv, sample_start
+from supermimic.envs.world_model_env import (
+  WorldModelEnv,
+  sample_replay_window,
+  sample_start,
+)
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -77,6 +81,18 @@ class SuperMimicRunnerCfg:
   )
   """Fractional slot allocation per task. Must sum to 1.0."""
   policy: BpttCfg | ActorCriticCfg = field(default_factory=ActorCriticCfg)
+  states_from: Literal["model", "sim", "model-fresh"] = "model"
+  """Where rollout states come from. 'model': imagined from random buffer
+  states (SuperMimic). 'sim': the newest simulator windows replayed with model
+  Jacobians (DMO). 'model-fresh': DMO's start states (each env's newest window)
+  imagined with the model, the control separating fresh starts from simulator
+  states. Fixed for a run: the policy update is a captured CUDA graph."""
+  dmo_hold: int = 0
+  """With states_from='sim' or 'model-fresh': if > 0, hold policy updates and
+  run this many after every horizon + 1 collected steps, so the first update of
+  each block starts from windows collected entirely by the current policy.
+  World model updates keep their usual schedule. 0 runs policy updates on the
+  usual schedule."""
 
   sampling_mode: Literal["uniform", "adaptive", "start", "return"] = "return"
   """RSI reset distribution: 'return' (concentrate resets on the bins where the
@@ -200,6 +216,12 @@ def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> N
   wm.load_bundle(
     torch.load(download_model_dir(run) / "world_model.pt", map_location=device)
   )
+
+
+def on_policy_block(step: int, horizon: int) -> bool:
+  """True on the loop steps where every action in each env's newest
+  ``horizon + 1`` stored frames was taken after the previous True step."""
+  return (step + 1) % (horizon + 1) == 0
 
 
 class Ratio:
@@ -588,6 +610,36 @@ class SuperMimicRunner:
       * self.cfg.replay_ratio
     )
 
+    policy_cfg = self.cfg.policy
+    replay = self.cfg.states_from != "model"
+    if replay and self.cfg.history_length > 1:
+      raise ValueError("states_from='sim'/'model-fresh' supports history_length=1")
+    if self.cfg.dmo_hold and not replay:
+      raise ValueError("dmo_hold needs states_from='sim' or 'model-fresh'")
+    # Replay needs a full window per env before the first policy update.
+    min_fill = self.cfg.wm.horizon
+    if replay:
+      min_fill = max(min_fill, policy_cfg.horizon + 1)
+
+    def policy_start() -> TensorDict:
+      if replay:
+        return sample_replay_window(
+          self.replay_buffer,
+          policy_cfg.horizon,
+          policy_cfg.batch_size,
+          replay_states=self.cfg.states_from == "sim",
+        )
+      return sample_start(
+        self.replay_buffer, self.cfg.history_length, policy_cfg.batch_size
+      )
+
+    def update_policy() -> None:
+      nonlocal policy_learn_time
+      starts = (policy_start() for _ in range(policy_cfg.num_batches))
+      start_policy_time = time.time()
+      loss_dict.update(self.policy_learner.update(starts))
+      policy_learn_time += time.time() - start_policy_time
+
     num_collected_steps = 0
     start_time = time.time()
     wm_learn_time = 0.0
@@ -601,30 +653,29 @@ class SuperMimicRunner:
       num_collected_steps += self.step()
 
       for _ in range(should_train(step)):
-        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
+        if self.replay_buffer.num_transitions < min_fill:
           continue
 
         data = (
           self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
           for _ in range(self.cfg.wm.num_batches)
         )
-        starts = (
-          sample_start(
-            self.replay_buffer, self.cfg.history_length, self.cfg.policy.batch_size
-          )
-          for _ in range(self.cfg.policy.num_batches)
-        )
 
         start_wm_time = time.time()
         wm_logs = self.world_model_learner.update(data)
         wm_learn_time += time.time() - start_wm_time
 
-        start_policy_time = time.time()
-        policy_logs = self.policy_learner.update(starts)
-        policy_learn_time += time.time() - start_policy_time
-
         loss_dict.update(wm_logs)
-        loss_dict.update(policy_logs)
+        if not self.cfg.dmo_hold:
+          update_policy()
+
+      if (
+        self.cfg.dmo_hold
+        and on_policy_block(step, policy_cfg.horizon)
+        and self.replay_buffer.num_transitions >= min_fill
+      ):
+        for _ in range(self.cfg.dmo_hold):
+          update_policy()
 
       if step % self.cfg.log_interval == 0:
         elapsed_time = time.time() - start_time
