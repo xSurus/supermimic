@@ -1,4 +1,4 @@
-"""copy_env_state: a copied env steps exactly like its source (CPU simulator)."""
+"""snapshot and restore: a restored env replays exactly as it ran (CPU simulator)."""
 
 import sys
 from pathlib import Path
@@ -10,16 +10,16 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.tasks.registry import load_env_cfg
 
 import supermimic.tasks  # noqa: F401
-from supermimic.utils.sim_clone import copy_env_state
+from supermimic.utils.sim_clone import restore, snapshot
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "colab"))
 from build_motions import convert  # noqa: E402
 
 
-def test_copied_env_steps_like_its_source(tmp_path):
+def test_restored_envs_replay_the_snapshot_trajectory(tmp_path):
   csv = tmp_path / "stand.csv"
   np.savetxt(
-    csv, np.tile([0, 0, 0.79, 0, 0, 0, 1] + [0.0] * 29, (60, 1)), delimiter=","
+    csv, np.tile([0, 0, 0.79, 0, 0, 0, 1] + [0.0] * 29, (600, 1)), delimiter=","
   )
   convert(csv, tmp_path / "stand.npz", "cpu")
 
@@ -31,6 +31,7 @@ def test_copied_env_steps_like_its_source(tmp_path):
   cfg.events["encoder_bias"].params["bias_range"] = (0.0, 0.0)
   cfg.scene.num_envs = 2
   cfg.episode_length_s = int(1e9)
+  cfg.seed = 0  # same reset frames every run
   env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
   env.reset()
   dim = env.action_manager.total_action_dim
@@ -38,16 +39,33 @@ def test_copied_env_steps_like_its_source(tmp_path):
   for _ in range(5):  # make the two envs differ
     env.step(torch.randn(2, dim) * 0.3)
   assert not torch.equal(env.sim.data.qpos[0], env.sim.data.qpos[1])
-
-  copy_env_state(env, torch.tensor([0]), torch.tensor([1]))
   origins = env.scene.env_origins
-  for _ in range(20):
-    _, reward, terminated, truncated, _ = env.step(
-      torch.randn(1, dim).repeat(2, 1) * 0.3
-    )
-    assert not (terminated | truncated).any()
+
+  def local_qpos() -> torch.Tensor:
     qpos = env.sim.data.qpos.clone()
     qpos[:, :3] -= origins  # each env's root relative to its own origin
-    assert torch.allclose(qpos[0], qpos[1], atol=1e-5)
-    assert torch.isclose(reward[0], reward[1], atol=1e-5)
+    return qpos
+
+  # Record env 0 for 20 steps from a snapshot, then put the snapshot back into
+  # env 0 (later, same env) and env 1 (another env) and replay the actions.
+  snap = snapshot(env, torch.tensor([0]))
+  obs0 = env.observation_manager.compute()["full_state"][0].clone()
+  actions = [torch.randn(1, dim).repeat(2, 1) * 0.1 for _ in range(20)]
+  recorded = []
+  for a in actions:
+    _, reward, *_ = env.step(a)
+    recorded.append((local_qpos()[0], reward[0].clone()))
+  restore(env, {k: v.repeat(2, *[1] * (v.dim() - 1)) for k, v in snap.items()},
+          torch.tensor([0, 1]))  # fmt: skip
+  # The policy acts on these: they must show the restored state, not a cache.
+  obs = env.observation_manager.compute()["full_state"]
+  assert torch.allclose(obs, obs0.expand(2, -1), atol=1e-5)
+  for k, (a, (qpos0, reward0)) in enumerate(zip(actions, recorded, strict=True)):
+    _, reward, terminated, truncated, _ = env.step(a)
+    assert torch.allclose(reward, reward0.expand(2), atol=1e-5)
+    done = terminated | truncated
+    if done.any():  # random actions can topple the robot; both must fall together
+      assert done.all() and k >= 10
+      break
+    assert torch.allclose(local_qpos(), qpos0.expand(2, -1), atol=1e-5)
   env.close()

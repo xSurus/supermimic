@@ -223,9 +223,14 @@ def sample_replay_window(
   state itself is never available and the step that ends an episode is predicted.
   Without ``replay_states`` (model-fresh) the rollout from that start is imagined."""
   window = buffer.sample_newest(horizon + 1, batch_size)
+  return replay_start(window) if replay_states else window[:, 0]
+
+
+def replay_start(window: TensorDict) -> TensorDict:
+  """The DMO start of a (B, horizon + 1) window of stored frames: frame 0 with
+  ``real`` attached (see ``sample_replay_window``)."""
+  batch_size, horizon = window.shape[0], window.shape[1] - 1
   start = window[:, 0]
-  if not replay_states:
-    return start
   ended = (window["terminated"] | window["truncated"])[:, :-1]
   next_is_real = ended.long().cumsum(1) == 0
   is_real = torch.cat([torch.ones_like(next_is_real[:, :1]), next_is_real[:, :-1]], 1)

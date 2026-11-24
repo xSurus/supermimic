@@ -53,29 +53,80 @@ def normalized_return(reward_sum: float, max_step: float, clip_len: int) -> floa
   return reward_sum / (max_step * (clip_len - 1))
 
 
-def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
-  device = setup_device(cfg.device)
-  env_cfg = load_env_cfg(task_id, play=False)
-  if not cfg.randomize:
-    # Pinned, not removed: removing an event would change the sim context layout
-    # the world model was trained on.
-    events = env_cfg.events
-    events["foot_friction"].params["ranges"] = (1.0, 1.0)
-    events["base_com"].params["ranges"] = {i: (0.0, 0.0) for i in range(3)}
-    events["encoder_bias"].params["bias_range"] = (0.0, 0.0)
+def pin_randomization(env_cfg: Any) -> None:
+  """Nominal foot friction, no CoM offset, no encoder bias (the paper's
+  appendix F). Pinned, not removed: removing an event would change the sim
+  context layout the world model was trained on."""
+  events = env_cfg.events
+  events["foot_friction"].params["ranges"] = (1.0, 1.0)
+  events["base_com"].params["ranges"] = {i: (0.0, 0.0) for i in range(3)}
+  events["encoder_bias"].params["bias_range"] = (0.0, 0.0)
 
+
+def load_run(task_id: str, wandb_path: str) -> tuple[Any, Any, Any]:
+  """``(api, run, runner_cfg)`` of a W&B training run (history_length 1 only)."""
   import wandb
 
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+  print(f"[INFO] Connecting to WandB run: {wandb_path}")
   api = wandb.Api()
-  run = api.run(cfg.wandb_path)
+  run = api.run(wandb_path)
   runner_cfg = load_runner_cfg(run.config)
   check_representation_matches(task_id, runner_cfg.representation)
   if runner_cfg.history_length != 1:
     raise ValueError(
-      f"history_length={runner_cfg.history_length} is not supported by evaluate.py "
+      f"history_length={runner_cfg.history_length} is not supported "
       "(only history_length == 1)"
     )
+  return api, run, runner_cfg
+
+
+def load_checkpoint(api, run, checkpoint: str, wm, runner_cfg, device: str):
+  """Load ``world_model.pt`` into ``wm`` and return ``(actor, model_dir,
+  artifact)`` with the actor in eval mode on the motion slot only."""
+  artifact = api.artifact(f"{run.entity}/{run.project}/model-{run.id}:{checkpoint}")
+  print(f"[INFO] Checkpoint artifact: {artifact.name} (version {artifact.version})")
+  model_dir = download_artifact_cached(artifact)
+  wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
+  actor = build_actor(runner_cfg, wm, device)
+  actor.set_slot_mix({"motion": 1.0})
+  actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
+  actor.eval()
+  return actor, model_dir, artifact
+
+
+def act(env, wm, actor, proprio: bool):
+  """One deterministic policy step's input and output, as the runner's
+  collection step builds them: ``(actions, full_state, motion_times, sim_ctx)``."""
+  representation = wm.representation
+  cmd = env.unwrapped.command_manager.get_term("motion")
+  obs = env.get_observations()  # the env and the models share one device
+  full_state = obs["full_state"]
+  motion_times = cmd.time_steps.clone()
+  rep_state = representation.represent(full_state)
+  aux_state = representation.extract_aux_state(full_state)
+  sim_ctx = wm.sim_context.read(env.unwrapped)
+  sensor = representation.compute_actor_sensor(
+    rep_state,
+    sim_ctx,
+    aux_state=aux_state,
+    sim_actor_obs=obs["actor"] if proprio else None,
+    noisy=proprio,
+  )
+  goals = {
+    ts.name: ts.extract_training_goal(cmd.motion, motion_times, aux_state)
+    for ts in actor.task_specs
+    if ts.name == "motion"
+  }
+  actions = actor(build_actor_obs_td(goals, sensor.unsqueeze(1)))
+  return actions, full_state, motion_times, sim_ctx
+
+
+def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
+  device = setup_device(cfg.device)
+  env_cfg = load_env_cfg(task_id, play=False)
+  if not cfg.randomize:
+    pin_randomization(env_cfg)
+  api, run, runner_cfg = load_run(task_id, cfg.wandb_path)
 
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
@@ -127,17 +178,7 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   cmd._sample_bins = start_of_own_clip
 
   wm = build_world_model(runner_cfg, env, device)
-  representation = wm.representation
-
-  artifact = api.artifact(f"{run.entity}/{run.project}/model-{run.id}:{cfg.checkpoint}")
-  print(f"[INFO] Checkpoint artifact: {artifact.name} (version {artifact.version})")
-  model_dir = download_artifact_cached(artifact)
-  wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
-  actor = build_actor(runner_cfg, wm, device)
-  actor.set_slot_mix({"motion": 1.0})
-  actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
-  actor.eval()
-  active_specs = [ts for ts in actor.task_specs if ts.name == "motion"]
+  actor, _, artifact = load_checkpoint(api, run, cfg.checkpoint, wm, runner_cfg, device)
   proprio = runner_cfg.actor_obs == "proprio"
 
   env.reset()
@@ -148,25 +189,7 @@ def evaluate(task_id: str, cfg: EvaluateConfig) -> dict:
   steps = torch.zeros(num_clips, dtype=torch.long, device=device)
   with torch.inference_mode():
     while alive.any():
-      obs = env.get_observations()
-      full_state = obs["full_state"].to(device)
-      motion_times = cmd.time_steps.to(device).clone()
-      rep_state = representation.represent(full_state)
-      aux_state = representation.extract_aux_state(full_state)
-      sim_ctx = wm.sim_context.read(base)
-      sensor = representation.compute_actor_sensor(
-        rep_state,
-        sim_ctx,
-        aux_state=aux_state,
-        sim_actor_obs=obs["actor"].to(device) if proprio else None,
-        noisy=proprio,
-      )
-      goals = {
-        ts.name: ts.extract_training_goal(motion, motion_times, aux_state)
-        for ts in active_specs
-      }
-      actions = actor(build_actor_obs_td(goals, sensor.unsqueeze(1)))
-
+      actions = act(env, wm, actor, proprio)[0]
       _, rewards, dones, _ = env.step(actions)
       tm = base.termination_manager
       failed = (tm.terminated & ~tm.time_outs).to(device)

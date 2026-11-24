@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 import torch
+import torch.nn as nn
 import tyro
 import wandb
 from tensordict import TensorDict
@@ -185,6 +186,13 @@ def build_world_model(
     num_goals=num_goals,
     num_actions=num_actions,
   )
+
+
+def build_critic(cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str) -> nn.Module:
+  """Critic MLP on ``[rep_state, goal, sim_ctx]``, the imagination env's
+  ``critic`` observation."""
+  input_dim = wm.representation.rep_state_dim + wm.num_goals + wm.sim_context.output_dim
+  return build_mlp(input_dim, cfg.critic_hidden_dims, output_dim=1).to(device)
 
 
 def build_actor(
@@ -456,16 +464,7 @@ class SuperMimicRunner:
       actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
-    critic_input_dim = (
-      self._representation.rep_state_dim
-      + self._num_goals
-      + self._sim_context.output_dim
-    )
-    critic = build_mlp(
-      critic_input_dim,
-      self.cfg.critic_hidden_dims,
-      output_dim=1,
-    ).to(self.device)
+    critic = build_critic(self.cfg, self._wm, self.device)
 
     policy_cfg = self.cfg.policy
 
