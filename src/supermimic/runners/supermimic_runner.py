@@ -232,6 +232,13 @@ def on_policy_block(step: int, horizon: int) -> bool:
   return (step + 1) % (horizon + 1) == 0
 
 
+def should_save_checkpoint(
+  step: int, save_interval: int, max_iterations: int
+) -> bool:
+  """Save every ``save_interval`` steps and always on the final step."""
+  return step % save_interval == 0 or step == max_iterations - 1
+
+
 class Ratio:
   def __init__(self, ratio: float) -> None:
     self._ratio = ratio
@@ -703,7 +710,7 @@ class SuperMimicRunner:
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
+      if should_save_checkpoint(step, self.cfg.save_interval, self.cfg.max_iterations):
         assert wandb.run is not None  # _init_wandb ran before the loop
         # The previous version must be logged before its files are overwritten.
         if upload is not None:

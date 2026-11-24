@@ -9,7 +9,10 @@ from tensordict import TensorDict
 from supermimic.envs.world_model_env import WorldModelEnv, sample_replay_window
 from supermimic.learners.policy_learner import replay_step_stats
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
-from supermimic.runners.supermimic_runner import on_policy_block
+from supermimic.runners.supermimic_runner import (
+  on_policy_block,
+  should_save_checkpoint,
+)
 from tests.conftest import (
   ACTION_DIM,
   make_actor_specs,
@@ -131,3 +134,16 @@ def test_on_policy_blocks_replay_only_actions_taken_since_the_last_block():
         assert step - horizon == last + 1
         last = step
     assert last > 0
+
+
+def test_should_save_checkpoint_includes_final_step():
+  saved_5000 = [s for s in range(5000) if should_save_checkpoint(s, 1000, 5000)]
+  assert saved_5000 == [0, 1000, 2000, 3000, 4000, 4999]
+  saved_300 = [s for s in range(300) if should_save_checkpoint(s, 1000, 300)]
+  assert saved_300 == [0, 299]
+
+
+def test_replay_start_motion_times_are_contiguous():
+  start = sample_replay_window(_buffer(steps=5), H, E)
+  assert start["motion_time"].is_contiguous()
+  assert start["real"]["motion_time"].is_contiguous()

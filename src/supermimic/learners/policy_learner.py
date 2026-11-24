@@ -61,11 +61,14 @@ def gae_returns(
   return returns
 
 
-def cap_weights(G: torch.Tensor, k: float) -> torch.Tensor:
+def cap_weights(
+  G: torch.Tensor, k: float, median: torch.Tensor | None = None
+) -> torch.Tensor:
   """Per-rollout weights that cap each norm in ``G`` at ``k`` batch medians. A
   zero median (most rollouts without gradient) caps nothing, rather than
   zeroing every rollout that has one."""
-  median = G.median()
+  if median is None:
+    median = G.median()
   w = (k * median / G.clamp_min(1e-12)).clamp(max=1.0)
   return torch.where(median > 0, w, torch.ones_like(w))
 
@@ -97,6 +100,8 @@ class BpttPolicyLearner:
     wm_env: WorldModelEnv,
     cfg: BpttPolicyLearnerCfg,
     device: str = "cpu",
+    *,
+    compile_actor: bool = True,
   ):
     self.actor = policy
     self.wm_env = wm_env
@@ -106,7 +111,9 @@ class BpttPolicyLearner:
       [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
     )
     self._rollout_actor = (
-      torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
+      torch.compile(self.actor)
+      if compile_actor and torch.device(device).type == "cuda"
+      else self.actor
     )
     self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
 
@@ -183,16 +190,16 @@ class BpttPolicyLearner:
   def _capped_loss(
     self, ret: torch.Tensor, taken: list[tuple[TensorDict, torch.Tensor]]
   ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Actor loss with each rollout's gradient capped at ``rollout_cap`` batch
-    medians. ``g_t = dret/da_t`` is the total derivative in each action, so
+    """Actor loss with each rollout's action-gradient norm capped at
+    ``rollout_cap`` batch medians (arXiv 2611.27648, Sec. V-A Eq. 2 & 5).
+    ``g_t = dret/da_t`` is the total derivative in each action, so
     ``sum_t g_t . pi(o_t)`` with ``o_t`` held fixed has the return's parameter
-    gradient; weighting it per rollout caps that rollout. ``G`` (the norm of a
-    rollout's stacked ``g_t``) stands in for its parameter-gradient norm."""
+    gradient; weighting it per rollout caps that rollout."""
     obs, actions = zip(*taken, strict=True)
     g = torch.autograd.grad(ret.sum(), actions)
     G = torch.stack([gt.pow(2).sum(-1) for gt in g]).sum(0).sqrt()
     median = G.median()
-    w = cap_weights(G, self.cfg.rollout_cap)
+    w = cap_weights(G, self.cfg.rollout_cap, median)
     surrogate, aux_loss = 0.0, 0.0
     for gt, o in zip(g, obs, strict=True):
       with torch.autocast("cuda", torch.bfloat16, enabled=o.is_cuda):
@@ -200,10 +207,13 @@ class BpttPolicyLearner:
       surrogate = surrogate + (gt * a).sum(-1)
       aux_loss = aux_loss + getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
     loss = (-w.detach() * surrogate + aux_loss).mean()
+    # Sort-indexed p99 avoids torch.quantile's host-scalar transfer under CUDA graphs.
+    p99_idx = int(0.99 * (G.numel() - 1))
+    g_p99 = G.sort().values[p99_idx]
     return loss, {
       "cap_frac": (w < 1.0).float().mean(),
       "G_median": median.detach(),
-      "G_p99": torch.quantile(G, 0.99).detach(),
+      "G_p99": g_p99.detach(),
     }
 
   def _bootstrap(
@@ -237,8 +247,10 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     wm_env: WorldModelEnv,
     cfg: ActorCriticPolicyLearnerCfg,
     device: str = "cpu",
+    *,
+    compile_actor: bool = True,
   ):
-    super().__init__(policy, wm_env, cfg, device)
+    super().__init__(policy, wm_env, cfg, device, compile_actor=compile_actor)
     self.critic = critic
     self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)

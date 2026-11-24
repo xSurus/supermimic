@@ -94,7 +94,7 @@ def load_checkpoint(api, run, checkpoint: str, wm, runner_cfg, device: str):
   return actor, model_dir, artifact
 
 
-def act(env, wm, actor, proprio: bool):
+def act(env, wm, actor, proprio: bool, *, noisy: bool = False):
   """One deterministic policy step's input and output, as the runner's
   collection step builds them: ``(actions, full_state, motion_times, sim_ctx)``."""
   representation = wm.representation
@@ -110,7 +110,7 @@ def act(env, wm, actor, proprio: bool):
     sim_ctx,
     aux_state=aux_state,
     sim_actor_obs=obs["actor"] if proprio else None,
-    noisy=proprio,
+    noisy=noisy and proprio,
   )
   goals = {
     ts.name: ts.extract_training_goal(cmd.motion, motion_times, aux_state)

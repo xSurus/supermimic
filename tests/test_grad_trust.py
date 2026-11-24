@@ -20,7 +20,7 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.scripts.evaluate import pin_randomization
-from supermimic.scripts.grad_trust import summarize, trust_at_starts
+from supermimic.scripts.grad_trust import summarize, summarize_paired, trust_at_starts
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "colab"))
 from build_motions import convert  # noqa: E402
@@ -36,6 +36,50 @@ def test_summarize_bins_by_batch_median_norm():
   assert out["bands"]["3-10"] == {"n": 1, "trust": pytest.approx(0.3)}
   assert out["bands"]["10-30"] == {"n": 0, "trust": None}
   assert out["bands"]["30-inf"] == {"n": 1, "trust": pytest.approx(0.0)}
+
+
+def test_summarize_rich_and_paired_metrics():
+  norm_m = torch.tensor([1.0, 1.0, 1.0, 2.0, 5.0, 12.0, 80.0])
+  norm_s = torch.tensor([1.0, 1.0, 1.0, 2.0, 2.5, 3.0, 4.0])
+  trust_m = torch.tensor([0.9, 0.9, 0.9, 0.8, 0.5, 0.2, 0.01])
+  trust_s = torch.tensor([0.9, 0.9, 0.9, 0.85, 0.7, 0.6, 0.5])
+  sign_m = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+  sign_s = torch.ones(7)
+  fell_base = torch.tensor([False, False, False, False, False, True, True])
+  real_frac = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.25])
+  cos = torch.tensor([1.0, 1.0, 1.0, 0.9, 0.8, 0.4, 0.1])
+
+  rich = summarize(
+    norm_m,
+    trust_m,
+    value=torch.arange(7.0),
+    trust_soft=trust_m,
+    model_fd_trust=torch.tensor([0.99, 0.99, 0.99, 0.98, 0.95, 0.4, 0.05]),
+    sign_agrees=sign_m,
+    fell_base=fell_base,
+    fell_any=fell_base,
+    replay_real_frac=real_frac,
+  )
+  assert rich["bands"]["30-inf"]["model_fd_trust"] == pytest.approx(0.05)
+  assert rich["bands"]["30-inf"]["fell_base_frac"] == pytest.approx(1.0)
+  assert rich["bands"]["30-inf"]["trust_surviving"] is None
+  assert rich["top_0p5_sq_share"] > 0.95
+
+  paired = summarize_paired(
+    {"norm": norm_m, "trust": trust_m, "trust_soft": trust_m, "sign_agrees": sign_m},
+    {
+      "norm": norm_s,
+      "trust": trust_s,
+      "trust_soft": trust_s,
+      "sign_agrees": sign_s,
+      "replay_real_frac": real_frac,
+    },
+    cos,
+  )
+  assert paired["bands"]["30-inf"]["model_trust"] == pytest.approx(0.01)
+  assert paired["bands"]["30-inf"]["sim_trust"] == pytest.approx(0.5)
+  assert paired["bands"]["30-inf"]["median_norm_ratio"] == pytest.approx(0.05)
+  assert paired["bands"]["30-inf"]["median_cos"] == pytest.approx(0.1)
 
 
 @pytest.mark.parametrize("eps", [0.0, 0.05])
@@ -72,11 +116,18 @@ def test_trust_runs_and_unshifted_copies_agree(tmp_path, eps):
     r = out[source]
     assert r["norm"].shape == (2,) and torch.isfinite(r["norm"]).all()
     assert (r["norm"] > 0).all()
+    assert r["near_clip_end"].shape == (2,)
+    assert r["cos_model_sim"].shape == (2,) and torch.isfinite(r["cos_model_sim"]).all()
     if eps == 0.0:
       # No shift: the copies replay the start, so J+ and J- differ only by
       # float32 rounding (each copy sits at its own world position).
       assert r["d_ret"].abs().max() < 1e-4
+      assert torch.isnan(r["trust"]).all()
+      assert torch.isnan(r["trust_soft"]).all()
     else:
       # A real shift moves the return well above that rounding.
       assert (r["d_ret"].abs() > 1e-4).all() and torch.isfinite(r["trust"]).all()
+      assert torch.isfinite(r["trust_soft"]).all()
+      if source == "model":
+        assert torch.isfinite(r["model_fd_trust"]).all()
   env.close()

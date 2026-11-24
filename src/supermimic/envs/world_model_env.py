@@ -230,7 +230,7 @@ def replay_start(window: TensorDict) -> TensorDict:
   """The DMO start of a (B, horizon + 1) window of stored frames: frame 0 with
   ``real`` attached (see ``sample_replay_window``)."""
   batch_size, horizon = window.shape[0], window.shape[1] - 1
-  start = window[:, 0]
+  start = window[:, 0].contiguous()
   ended = (window["terminated"] | window["truncated"])[:, :-1]
   next_is_real = ended.long().cumsum(1) == 0
   is_real = torch.cat([torch.ones_like(next_is_real[:, :1]), next_is_real[:, :-1]], 1)
@@ -238,7 +238,7 @@ def replay_start(window: TensorDict) -> TensorDict:
     {
       "action": window["action"][:, :-1],
       "state": window["state"][:, 1:],
-      "motion_time": window["motion_time"][:, 1:],
+      "motion_time": window["motion_time"][:, 1:].contiguous(),
       "is_real": is_real,
       "next_is_real": next_is_real,
     },
