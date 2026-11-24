@@ -93,6 +93,67 @@ def test_actor_critic_bootstraps_the_surviving_last_state():
   assert torch.isfinite(stats["Policy/value_function"])
 
 
+class _PointEnv:
+  """s' = s + a, reward -s'^2: each action moves every later state, so the total
+  action gradient differs from the one-step one."""
+
+  max_step_reward = 1.0
+
+  def __init__(self):
+    self.dynamics = nn.Linear(1, 1)
+    self.representation = _DummyRepresentation()
+
+  def reset(self, batch: TensorDict) -> TensorDict:
+    self.s = batch["state"]
+    return self._obs()
+
+  def step(self, actions: torch.Tensor):
+    self.s = self.s + actions
+    reward = -self.s.pow(2).squeeze(-1)
+    return self._obs(), reward, torch.zeros_like(reward)
+
+  def _obs(self) -> TensorDict:
+    obs = {"actor": self.s, "critic": self.s}
+    return TensorDict(obs, batch_size=[self.s.shape[0]])
+
+
+class _LinearActor(nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.net = nn.Linear(1, 1)
+    with torch.no_grad():
+      self.net.weight.fill_(-0.3)
+      self.net.bias.fill_(0.05)
+
+  def forward(self, obs: TensorDict) -> torch.Tensor:
+    return self.net(obs["actor"])
+
+
+def _capped_update(cap: float, states: list[float]):
+  actor = _LinearActor()
+  cfg = BpttPolicyLearnerCfg(horizon=3, rollout_cap=cap, grad_clip_value=0.0)
+  learner = BpttPolicyLearner(actor, _PointEnv(), cfg)
+  start = TensorDict({"state": torch.tensor(states)[:, None]}, batch_size=[len(states)])
+  stats = learner.update([start])
+  # Compare gradients, not parameters: Adam's first step hides a scale error.
+  return torch.cat([p.grad.flatten() for p in actor.parameters()]), stats
+
+
+def test_rollout_cap_that_never_binds_matches_the_uncapped_update():
+  states = [0.04, -0.08, 0.12, 0.02]
+  plain, stats_plain = _capped_update(0.0, states)
+  capped, stats = _capped_update(1e9, states)
+  assert stats_plain["Policy/grad_norm"] < 1.0  # below the global clip
+  assert plain.abs().min() > 0
+  assert torch.allclose(plain, capped, atol=1e-6)
+  assert stats["Policy/cap_frac"] == 0.0
+
+
+def test_rollout_cap_scales_down_only_the_outlier_rollout():
+  _, stats = _capped_update(2.0, [0.1, 0.1, 0.1, 10.0])
+  assert stats["Policy/cap_frac"] == pytest.approx(0.25)
+
+
 def test_gae_returns_discount_by_soft_done():
   returns = gae_returns(
     values=torch.zeros(2, 1),

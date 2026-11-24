@@ -28,6 +28,9 @@ class BpttPolicyLearnerCfg:
   survival_masking: bool = True
   beta2: float = 0.95  # faster Adam EMA recovery after gradient spikes
   grad_clip_value: float = 0.1  # per-parameter gradient element clipping
+  rollout_cap: float = 0.0
+  """Cap each rollout's gradient at this many batch-median norms (arXiv
+  2611.27648 uses 10). 0 is off. Costs a second, policy-only actor pass."""
 
 
 @dataclass
@@ -121,9 +124,12 @@ class BpttPolicyLearner:
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     rollout: list[TensorDict] = []
     replay_stats: dict[str, torch.Tensor] = {}
+    taken: list[tuple[TensorDict, torch.Tensor]] = []  # (obs, action) for the cap
     for t in range(cfg.horizon):
       with torch.autocast("cuda", torch.bfloat16, enabled=obs.is_cuda):
         actions = self._rollout_actor(obs).float()
+      if cfg.rollout_cap:
+        taken.append((obs.detach(), actions))
       if real is None:
         next_obs, reward, term_prob = self.wm_env.step(actions)
       else:
@@ -140,7 +146,11 @@ class BpttPolicyLearner:
         survival = survival * (1 - term_prob)
       obs = next_obs
     ret = ret + self._bootstrap(obs, survival, term_prob)
-    loss = (-ret + aux_loss).mean()
+    cap_stats: dict[str, torch.Tensor] = {}
+    if cfg.rollout_cap:
+      loss, cap_stats = self._capped_loss(ret, taken)
+    else:
+      loss = (-ret + aux_loss).mean()
     grad_norm = _optimize_step(
       self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value
     )
@@ -148,8 +158,35 @@ class BpttPolicyLearner:
       "return": ret.mean().detach(),
       "grad_norm": grad_norm,
       **replay_stats,
+      **cap_stats,
       **self._fit_critic(rollout, obs),
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
+    }
+
+  def _capped_loss(
+    self, ret: torch.Tensor, taken: list[tuple[TensorDict, torch.Tensor]]
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Actor loss with each rollout's gradient capped at ``rollout_cap`` batch
+    medians. ``g_t = dret/da_t`` is the total derivative in each action, so
+    ``sum_t g_t . pi(o_t)`` with ``o_t`` held fixed has the return's parameter
+    gradient; weighting it per rollout caps that rollout. ``G`` (the norm of a
+    rollout's stacked ``g_t``) stands in for its parameter-gradient norm."""
+    obs, actions = zip(*taken, strict=True)
+    g = torch.autograd.grad(ret.sum(), actions)
+    G = torch.stack([gt.pow(2).sum(-1) for gt in g]).sum(0).sqrt()
+    median = G.median()
+    w = (self.cfg.rollout_cap * median / G.clamp_min(1e-12)).clamp(max=1.0)
+    surrogate, aux_loss = 0.0, 0.0
+    for gt, o in zip(g, obs, strict=True):
+      with torch.autocast("cuda", torch.bfloat16, enabled=o.is_cuda):
+        a = self._rollout_actor(o).float()
+      surrogate = surrogate + (gt * a).sum(-1)
+      aux_loss = aux_loss + getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+    loss = (-w.detach() * surrogate + aux_loss).mean()
+    return loss, {
+      "cap_frac": (w < 1.0).float().mean(),
+      "G_median": median.detach(),
+      "G_p99": torch.quantile(G, 0.99).detach(),
     }
 
   def _bootstrap(
