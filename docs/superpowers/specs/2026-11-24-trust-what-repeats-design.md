@@ -75,9 +75,13 @@ Day-one check: on the base checkpoint, the model-state column should roughly mat
 
 Walk1, seeds 1 to 3, notebook section 8c extended to the 2x2 plus `fresh`: `base`, `base-cap`, `dmo`, `dmo-cap`, `fresh`, named `walk1-v2-<arm>-s<seed>`, pinned to the cap commit. Then `grad_trust.py` on the final and one early checkpoint of `base` and `dmo`. Later: 40 LAFAN1 clips, base and base+cap, 3 seeds, plus one run at the paper's settings (H = 64, B = 1024, lr 4e-4, cap 10).
 
+## Settled while building
+
+- Simulator state for step 3 (2026-11-24): `utils/sim_clone.py:copy_env_state` copies one env into others mid-episode. It copies `qpos`, `qvel`, `act` and `qacc_warmstart`, the action manager's action history, the motion clock (`set_time_steps`) and the episode length, shifts the root by the env-origin difference, then runs `forward()` and `update_relative_body_poses()`. On the CPU simulator a copy matches its source to 1e-5 in `qpos` and reward for 20 steps (`tests/test_sim_clone.py`). The task has no actuator delay or observation history. Per-env randomized model fields are not copied, so trust runs pin randomization to nominal as `evaluate.py` does. Copy-then-play replaces save-and-restore: the start env keeps playing unperturbed and its copies play `+delta` and `-delta`.
+
 ## Left to the builder
 
-- Setting simulator state for step 3: build on `Entity.write_root_state_to_sim` and `write_joint_state_to_sim` in mjlab. The motion clock, the action manager's last action and the actuator delay buffer must also be set, or the reward differs. Check which of these mjlab restores on a write.
-- Contact labels: foot contact sensors read during play.
+- Whether the copy stays exact on GPU (warp kernels may not be deterministic there). Check on Colab before trusting trust numbers; small drift only adds noise to `J+ - J-`.
+- Contact labels: the task has only a self-collision contact sensor, so foot contact needs a `ContactSensorCfg` on the feet added in the trust script's env cfg.
 - Whether N = 5,456 starts (the paper's number) fits one batch on a T4 or needs chunking.
 - Whether `torch.median` and `autograd.grad` capture cleanly. Checked on Colab before any cap run.
