@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Iterable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -78,6 +79,23 @@ def _identity(state: list[torch.Tensor]) -> list[int]:
   return [x.data_ptr() for x in state]
 
 
+def _clone_value(value: Any) -> Any:
+  if isinstance(value, (torch.Tensor, TensorDict)):
+    return value.detach().clone()
+  if isinstance(value, dict):
+    return {k: _clone_value(v) for k, v in value.items()}
+  if isinstance(value, tuple):
+    return tuple(_clone_value(v) for v in value)
+  if isinstance(value, list):
+    return [_clone_value(v) for v in value]
+  return value
+
+
+def _clone_outputs(outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+  """Copy captured outputs out of the shared CUDA-graph memory pool."""
+  return {k: _clone_value(v) for k, v in outputs.items()}
+
+
 @functools.cache
 def _capture_stream_and_pool(device: torch.device):
   return torch.cuda.Stream(device), torch.cuda.graph_pool_handle()
@@ -87,11 +105,12 @@ class CapturedUpdate:
   """Runs ``fn`` eagerly for its first ``warmup`` calls, then records it once as
   a CUDA graph and replays it on the device of ``state()``. ``fn`` must be
   capture-safe: no host syncs, fixed shapes, and every tensor it reads besides
-  its inputs updated in place. Python values it reads are fixed at capture, and
-  each replay overwrites the outputs it returns. All CapturedUpdates on a device
-  record on one stream into one memory pool and must replay in the order they
-  were recorded. A replay raises if a tensor in ``state()`` moved; a learning rate
-  that changes is a device tensor, changed in place with ``group["lr"].fill_(lr)``."""
+  its inputs updated in place. Python values it reads are fixed at capture. All
+  CapturedUpdates on a device record on one stream into one shared scratch
+  memory pool; returned outputs are cloned out of the pool after replay so
+  subsequent replays of any CapturedUpdate cannot overwrite them. A replay
+  raises if a tensor in ``state()`` moved; a learning rate that changes is a
+  device tensor, changed in place with ``group["lr"].fill_(lr)``."""
 
   def __init__(
     self,
@@ -132,5 +151,6 @@ class CapturedUpdate:
       elif _identity(state) != self._identity:
         raise RuntimeError("a captured tensor moved")
       self._graph.replay()
+      outputs = _clone_outputs(self._outputs)
       torch.cuda.current_stream().synchronize()
-      return self._outputs
+      return outputs

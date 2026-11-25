@@ -44,6 +44,7 @@ def restore(
   cmd.set_time_steps(ids, snap["time_steps"])
   env.episode_length_buf[ids] = snap["episode_length"]
   env.sim.forward()
+  env.sim.sense()
   cmd.update_relative_body_poses()
   # The observation manager returns its cached buffer unless asked to update.
   # The task keeps no observation history, so updating it is safe.

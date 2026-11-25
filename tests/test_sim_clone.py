@@ -69,3 +69,45 @@ def test_restored_envs_replay_the_snapshot_trajectory(tmp_path):
       break
     assert torch.allclose(local_qpos(), qpos0.expand(2, -1), atol=1e-5)
   env.close()
+
+
+def test_restore_refreshes_foot_contact_sensor(tmp_path):
+  from supermimic.scripts.grad_trust import FOOT_CONTACT_SENSOR, add_foot_contact_sensor
+
+  csv = tmp_path / "stand.csv"
+  np.savetxt(
+    csv, np.tile([0, 0, 0.79, 0, 0, 0, 1] + [0.0] * 29, (600, 1)), delimiter=","
+  )
+  convert(csv, tmp_path / "stand.npz", "cpu")
+  cfg = load_env_cfg("SuperMimic-GenCoord-G1", play=False)
+  add_foot_contact_sensor(cfg)
+  cfg.commands["motion"].motion_file = [str(tmp_path / "stand.npz")]
+  cfg.commands["motion"].sampling_mode = "uniform"
+  cfg.scene.num_envs = 2
+  cfg.episode_length_s = int(1e9)
+  cfg.seed = 0
+  env = ManagerBasedRlEnv(cfg=cfg, device="cpu")
+  env.reset()
+  sensor = env.scene[FOOT_CONTACT_SENSOR]
+  # Step with zero actions so the standing robot settles firmly on the ground.
+  zeros = torch.zeros(2, env.action_manager.total_action_dim)
+  for _ in range(5):
+    env.step(zeros)
+  grounded = (sensor.data.found[0] > 0).clone()
+  assert grounded.any(), "expected standing robot to have ground foot contact"
+  snap = snapshot(env, torch.tensor([0]))
+
+  # Lift both envs into the air so contacts drop to zero, then restore grounded snap.
+  env.sim.data.qpos[:, 2] += 2.0
+  env.sim.forward()
+  assert not (sensor.data.found > 0).any()
+
+  restore(
+    env,
+    {k: v.repeat(2, *[1] * (v.dim() - 1)) for k, v in snap.items()},
+    torch.tensor([0, 1]),
+  )
+  restored = sensor.data.found > 0
+  assert torch.equal(restored[0], grounded)
+  assert torch.equal(restored[1], grounded)
+  env.close()
